@@ -1,0 +1,299 @@
+# OtaKit self-hosted stack. Setup and security notes: docker/README.md.
+#
+#   # once: writes .env with generated secrets
+#   docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/work" \
+#     ghcr.io/mecko/otakit-console node /app/docker/init-env.mjs
+#   docker compose up -d
+#
+# Only the console (3000), the S3 API / public bundle endpoint (9000) and the
+# event ingest (8787) are published, on 127.0.0.1 unless OTAKIT_BIND_ADDRESS
+# says otherwise. Postgres,
+# the cron runner and the setup jobs sit on an internal network with no
+# internet access and no host ports.
+
+name: otakit
+
+x-logging: &logging
+  driver: local
+  options:
+    max-size: 10m
+    max-file: '3'
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging: *logging
+
+x-database-url: &database-url postgresql://otakit:${POSTGRES_PASSWORD:?Generate .env first; see the README}@postgres:5432/otakit
+
+services:
+  postgres:
+    <<: *hardening
+    image: postgres:17-alpine
+    # The entrypoint fixes data-dir ownership and then drops to the postgres user.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    environment:
+      POSTGRES_USER: otakit
+      POSTGRES_DB: otakit
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate .env first; see the README}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    shm_size: 128mb
+    networks: [backend]
+    healthcheck:
+      # TCP, not the socket: on first start the image initialises the database
+      # on a socket-only temporary server, so this stays unhealthy until that's done.
+      test: ['CMD', 'pg_isready', '-h', '127.0.0.1', '-U', 'otakit', '-d', 'otakit']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rustfs:
+    <<: *hardening
+    image: rustfs/rustfs:1.0.1
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:?Generate .env first; see the README}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:?Generate .env first; see the README}
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      # No web console: manage it with the AWS CLI (see README) instead of another login page.
+      RUSTFS_CONSOLE_ENABLE: 'false'
+    volumes:
+      - rustfs-data:/data
+    ports:
+      # The CLI uploads here with presigned URLs and devices download from here,
+      # so it has to be reachable from outside Docker.
+      - ${OTAKIT_BIND_ADDRESS:-127.0.0.1}:9000:9000
+    networks: [frontend, backend]
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', '-o', '/dev/null', 'http://127.0.0.1:9000/health']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # One-shot, safe to re-run: creates the bucket and makes the objects devices
+  # fetch publicly readable, as a CDN would serve them (by exact key; no
+  # listing, no writes). ($$ escapes compose interpolation; the shell sees $.)
+  storage-init:
+    <<: *hardening
+    image: curlimages/curl:8.15.0
+    restart: 'no'
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        # S3 requests signed with SigV4; prints the HTTP status.
+        s3() {
+          curl -sS -o /tmp/response -w '%{http_code}' --aws-sigv4 aws:amz:us-east-1:s3 \
+            --user "$$S3_ACCESS_KEY:$$S3_SECRET_KEY" -X PUT "$$@"
+        }
+        status=$$(s3 "http://rustfs:9000/$$S3_BUCKET")
+        # 409: the bucket already exists.
+        case $$status in 200|409) ;; *) cat /tmp/response >&2; exit 1 ;; esac
+        status=$$(s3 "http://rustfs:9000/$$S3_BUCKET?policy" --data-binary @- <<EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "AWS": ["*"] },
+              "Action": ["s3:GetObject"],
+              "Resource": [
+                "arn:aws:s3:::$$S3_BUCKET/manifests/*",
+                "arn:aws:s3:::$$S3_BUCKET/bundles/*",
+                "arn:aws:s3:::$$S3_BUCKET/files/*"
+              ]
+            }
+          ]
+        }
+        EOF
+        )
+        case $$status in 200|204) ;; *) cat /tmp/response >&2; exit 1 ;; esac
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET:-otakit-bundles}
+    networks: [backend]
+    depends_on:
+      rustfs:
+        condition: service_healthy
+
+  # One-shot: applies the console and push migrations before the console starts.
+  migrate:
+    <<: *hardening
+    image: ${OTAKIT_IMAGE:-ghcr.io/mecko/otakit-console:latest}
+    restart: 'no'
+    command:
+      - sh
+      - -c
+      # migrate.mjs doesn't pass its own schema, so without --schema Prisma would
+      # apply the console schema in this directory and skip the push tables.
+      - >-
+        node ../push-server/scripts/migrate.mjs --schema ../push-server/prisma/schema.prisma
+        && node node_modules/prisma/build/index.js migrate deploy
+    environment:
+      DATABASE_URL: *database-url
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [backend]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  console:
+    <<: *hardening
+    image: ${OTAKIT_IMAGE:-ghcr.io/mecko/otakit-console:latest}
+    environment:
+      DATABASE_URL: *database-url
+      SECRET_KEY: ${SECRET_KEY:?Generate .env first; see the README}
+      CRON_SECRET: ${CRON_SECRET:?Generate .env first; see the README}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?Generate .env first; see the README}
+
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Generate .env first; see the README}
+      BETTER_AUTH_URL: ${OTAKIT_URL:-http://localhost:3000}
+      NEXT_PUBLIC_APP_URL: ${OTAKIT_URL:-http://localhost:3000}
+      # Email OTP sign-in always works: without Resend, codes are printed to
+      # `docker compose logs console`. OAuth providers are optional.
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-OtaKit <noreply@localhost>}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+
+      R2_BUCKET: ${S3_BUCKET:-otakit-bundles}
+      R2_ACCESS_KEY: ${S3_ACCESS_KEY}
+      R2_SECRET_KEY: ${S3_SECRET_KEY}
+      R2_REGION: us-east-1
+      R2_ENDPOINT: http://rustfs:9000
+      R2_PUBLIC_ENDPOINT: ${OTAKIT_S3_URL:-http://localhost:9000}
+      R2_FORCE_PATH_STYLE: 'true'
+      CDN_BASE_URL: ${OTAKIT_S3_URL:-http://localhost:9000}/${S3_BUCKET:-otakit-bundles}
+
+      MANIFEST_SIGNING_KID: ${MANIFEST_SIGNING_KID:?Generate .env first; see the README}
+      MANIFEST_SIGNING_KEY: ${MANIFEST_SIGNING_KEY:?Generate .env first; see the README}
+
+      # Device analytics (`events` profile); off while TINYBIRD_TOKEN is empty.
+      TINYBIRD_READ_TOKEN: ${TINYBIRD_TOKEN:-}
+      TINYBIRD_API_HOST: https://tinybird:7181
+      NODE_OPTIONS: --import /app/docker/tinybird/http-fetch.mjs
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/packages/console/.next/cache:uid=1000,gid=1000,mode=0700
+    ports:
+      - ${OTAKIT_BIND_ADDRESS:-127.0.0.1}:3000:3000
+    networks: [frontend, backend]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      storage-init:
+        condition: service_completed_successfully
+
+  # Stands in for the Vercel crons: push delivery every minute, preview-link
+  # expiry every 5. ($$ escapes compose interpolation; the shell sees $.)
+  cron:
+    <<: *hardening
+    image: curlimages/curl:8.15.0
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        call() {
+          curl -fsS -o /dev/null -m 300 -X POST \
+            -H "Authorization: Bearer $$CRON_SECRET" "http://console:3000$$1" \
+            || echo "cron: $$1 failed" >&2
+        }
+        minute=0
+        while :; do
+          call /api/cron/push
+          if [ $$((minute % 5)) -eq 0 ]; then call /api/cron/previews; fi
+          minute=$$((minute + 1))
+          sleep 60
+        done
+    environment:
+      CRON_SECRET: ${CRON_SECRET}
+    read_only: true
+    networks: [backend]
+    depends_on:
+      console:
+        condition: service_healthy
+
+  # Optional (`--profile events`, turned on by init-env.mjs --events): device
+  # analytics. Devices post events to `ingest`, which then runs the ingest Worker
+  # (packages/ingest) under Node, deploys tinybird/ on start, and batches events
+  # into Tinybird Local on the internal network; the console reads from there.
+
+  # Tinybird publishes only `latest`, so this is pinned by digest. Not hardened
+  # like the rest: it runs ClickHouse and Redis under its own supervisor.
+  tinybird:
+    image: tinybirdco/tinybird-local@sha256:c1e2b1cc1f94878192d1c1dd5cda952ceeaa503c0af10d35b3737d1f566a7dad
+    profiles: [events]
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      TB_LOCAL_WORKSPACE_TOKEN: ${TINYBIRD_TOKEN:-}
+      TB_LOCAL_USER_TOKEN: ${TINYBIRD_USER_TOKEN:-}
+    volumes:
+      - tinybird-data:/var/lib/clickhouse
+      - tinybird-metadata:/redis-data
+    networks: [backend]
+
+  # Always runs. With TINYBIRD_TOKEN set it feeds Tinybird; without it, it
+  # answers event posts with 200, logs them and stores nothing, so apps whose
+  # ingestUrl points here keep working with events off (docker/ingest/sink.mjs).
+  ingest:
+    <<: *hardening
+    image: ${OTAKIT_IMAGE:-ghcr.io/mecko/otakit-console:latest}
+    # --no-warnings: Node notes the Worker is TypeScript in a package without "type".
+    command: ['node', '--no-warnings', '/app/docker/ingest/main.mjs']
+    environment:
+      TINYBIRD_TOKEN: ${TINYBIRD_TOKEN:-}
+    read_only: true
+    tmpfs: [/tmp]
+    ports:
+      # Devices post events here (the app's ingestUrl is this origin + /v1).
+      - ${OTAKIT_BIND_ADDRESS:-127.0.0.1}:8787:8787
+    networks: [frontend, backend]
+    # The image's healthcheck is the console's.
+    healthcheck:
+      disable: true
+    # No depends_on tinybird: it is off without the `events` profile, and the
+    # Tinybird deploy on start waits for it anyway.
+
+  # Optional (`--profile tunnel`): exposes the console and RustFS through a
+  # Cloudflare Tunnel, so the host needs no inbound ports or certificates.
+  # Public hostnames are configured on the tunnel in the Cloudflare dashboard.
+  cloudflared:
+    <<: *hardening
+    image: cloudflare/cloudflared:2026.9.3
+    profiles: [tunnel]
+    command: ['tunnel', '--no-autoupdate', 'run']
+    environment:
+      # Not `:?`: compose interpolates every service, profile or not.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    read_only: true
+    networks: [frontend]
+    depends_on:
+      console:
+        condition: service_healthy
+      rustfs:
+        condition: service_healthy
+
+networks:
+  # Published ports and outbound traffic (OAuth providers, Resend, the tunnel).
+  frontend:
+  # Service-to-service only: no internet access, no host ports.
+  backend:
+    internal: true
+
+volumes:
+  postgres-data:
+  rustfs-data:
+  tinybird-data:
+  tinybird-metadata:

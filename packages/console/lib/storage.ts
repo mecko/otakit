@@ -21,6 +21,8 @@ export class UploadedObjectNotFoundError extends Error {
 
 type StorageConfig = {
   client: S3Client;
+  /** Signs the URLs handed to uploaders; differs from `client` only with R2_PUBLIC_ENDPOINT. */
+  presignClient: S3Client;
   bucket: string;
   maxBundleSize: number;
   presignExpiresSeconds: number;
@@ -51,14 +53,27 @@ function getStorageConfig(): StorageConfig {
       ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
       : undefined);
 
-  const client = new S3Client({
-    region: process.env.R2_REGION ?? 'auto',
-    endpoint,
-    credentials: {
-      accessKeyId,
-      secretAccessKey,
-    },
-  });
+  // RustFS and most self-hosted S3 servers only serve path-style URLs
+  // (endpoint/bucket/key), not bucket subdomains.
+  const forcePathStyle = ['1', 'true', 'yes'].includes(
+    process.env.R2_FORCE_PATH_STYLE?.trim().toLowerCase() ?? '',
+  );
+  const createClient = (clientEndpoint: string | undefined) =>
+    new S3Client({
+      region: process.env.R2_REGION ?? 'auto',
+      endpoint: clientEndpoint,
+      forcePathStyle,
+      credentials: {
+        accessKeyId,
+        secretAccessKey,
+      },
+    });
+
+  const client = createClient(endpoint);
+  // When the server reaches storage on an internal address (e.g. a Docker
+  // network), presigned upload URLs must still name a host the CLI can reach.
+  const publicEndpoint = process.env.R2_PUBLIC_ENDPOINT?.trim();
+  const presignClient = publicEndpoint ? createClient(publicEndpoint) : client;
 
   const maxBundleSize = Number.parseInt(
     process.env.MAX_BUNDLE_SIZE ?? `${DEFAULT_MAX_BUNDLE_SIZE}`,
@@ -71,6 +86,7 @@ function getStorageConfig(): StorageConfig {
 
   cachedConfig = {
     client,
+    presignClient,
     bucket,
     maxBundleSize,
     presignExpiresSeconds,
@@ -88,7 +104,7 @@ export async function createPresignedUpload(
   uploadId: string,
   size: number,
 ): Promise<{ presignedUrl: string; storageKey: string; expiresAt: Date }> {
-  const { client, bucket, presignExpiresSeconds } = getStorageConfig();
+  const { presignClient, bucket, presignExpiresSeconds } = getStorageConfig();
 
   const storageKey = `bundles/${appId}/${uploadId}.zip`;
   const command = new PutObjectCommand({
@@ -99,7 +115,7 @@ export async function createPresignedUpload(
     CacheControl: BUNDLE_CACHE_CONTROL,
   });
 
-  const presignedUrl = await getSignedUrl(client, command, {
+  const presignedUrl = await getSignedUrl(presignClient, command, {
     expiresIn: presignExpiresSeconds,
   });
 
@@ -167,7 +183,7 @@ export async function createPresignedFileUpload(
   size: number,
   contentMd5: string,
 ): Promise<{ presignedUrl: string; expiresAt: Date }> {
-  const { client, bucket, presignExpiresSeconds } = getStorageConfig();
+  const { presignClient, bucket, presignExpiresSeconds } = getStorageConfig();
 
   // ContentMD5 makes storage verify the uploaded bytes: a PUT whose body
   // doesn't match the client-declared MD5 is rejected, so a content-addressed
@@ -181,7 +197,7 @@ export async function createPresignedFileUpload(
     CacheControl: BUNDLE_CACHE_CONTROL,
   });
 
-  const presignedUrl = await getSignedUrl(client, command, {
+  const presignedUrl = await getSignedUrl(presignClient, command, {
     expiresIn: presignExpiresSeconds,
   });
 
