@@ -1,0 +1,28 @@
+# BuildKit reads this file for docker/console.Dockerfile (context: repo root).
+
+**/node_modules
+**/.next
+**/dist
+**/build
+**/coverage
+**/.turbo
+**/*.tsbuildinfo
+.git
+.github
+.pnpm-store
+.vercel
+.wrangler
+
+# Secrets never enter the build context.
+**/.env
+**/.env.*
+!**/.env.example
+**/.dev.vars*
+docker/.env
+
+# Native sources the console does not build from. (tinybird/ stays: the
+# `events` profile deploys it from this image.)
+packages/capacitor-plugin/ios
+packages/capacitor-plugin/android
+examples/*/ios
+examples/*/android
